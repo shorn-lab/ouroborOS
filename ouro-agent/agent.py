@@ -1,18 +1,143 @@
 import sys
-import json
+import types
+import warnings
+import sys
+import types
+import warnings
+
+def _patch_transformers():
+    """Patch all missing functions for Ouro model compatibility."""
+    
+    # 1. Patch layer_type_validation
+    try:
+        from transformers.configuration_utils import layer_type_validation
+        print("✓ layer_type_validation already available")
+    except ImportError:
+        print("⚠️ Patching missing layer_type_validation")
+        def _layer_type_validation(layer_types, allowed_types=None):
+            """Mock validation that always passes."""
+            if allowed_types is None:
+                allowed_types = ['full_attention', 'sliding_attention']
+            for lt in layer_types:
+                if lt not in allowed_types:
+                    warnings.warn(f"Unknown layer type: {lt}")
+            return True
+        
+        import transformers.configuration_utils as cu
+        cu.layer_type_validation = _layer_type_validation
+    
+    # 2. Patch rope_config_validation
+    try:
+        from transformers.modeling_rope_utils import rope_config_validation
+        print("✓ rope_config_validation already available")
+    except ImportError:
+        print("⚠️ Patching missing rope_config_validation")
+        def _rope_config_validation(config):
+            """Mock rope validation that passes."""
+            return True
+        
+        import transformers.modeling_rope_utils as ru
+        ru.rope_config_validation = _rope_config_validation
+    
+    # 3. Patch compute_default_rope_parameters (the one you're missing)
+    try:
+        from transformers.modeling_rope_utils import _compute_default_rope_parameters
+        print("✓ _compute_default_rope_parameters already available")
+    except ImportError:
+        print("⚠️ Patching missing _compute_default_rope_parameters")
+        
+        def _compute_default_rope_parameters(config, device=None, seq_len=None, **rope_kwargs):
+            """
+            Compute default RoPE parameters for Ouro model.
+            Based on implementation from transformers 4.54.1
+            """
+            import torch
+            
+            # Handle different input patterns
+            if config is not None:
+                base = getattr(config, "rope_theta", 10000.0)
+                partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+                head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+                dim = int(head_dim * partial_rotary_factor)
+            elif len(rope_kwargs) > 0:
+                base = rope_kwargs.get("base", 10000.0)
+                dim = rope_kwargs.get("dim", 128)
+            else:
+                base = 10000.0
+                dim = 128
+            
+            # Compute inverse frequencies
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+            attention_factor = 1.0
+            
+            return inv_freq, attention_factor
+        
+        # Patch both the public and private versions
+        import transformers.modeling_rope_utils as ru
+        ru._compute_default_rope_parameters = _compute_default_rope_parameters
+        ru.compute_default_rope_parameters = _compute_default_rope_parameters  # Some versions may expect this name
+    
+    # 4. Also patch compute_llama3_parameters if needed (for some model variants)
+    try:
+        from transformers.modeling_rope_utils import _compute_llama3_parameters
+        print("✓ _compute_llama3_parameters already available")
+    except ImportError:
+        print("⚠️ Patching missing _compute_llama3_parameters")
+        
+        def _compute_llama3_parameters(config, device, seq_len, **rope_kwargs):
+            """Fallback for llama3-style RoPE parameters"""
+            return _compute_default_rope_parameters(config, device, seq_len, **rope_kwargs)
+        
+        import transformers.modeling_rope_utils as ru
+        ru._compute_llama3_parameters = _compute_llama3_parameters
+    
+    # 5. Ensure ALLOWED_LAYER_TYPES exists
+    try:
+        import transformers.configuration_utils as cu
+        if not hasattr(cu, 'ALLOWED_LAYER_TYPES'):
+            cu.ALLOWED_LAYER_TYPES = [
+                'full_attention', 'sliding_attention', 'full_attention_no_rope',
+                'sliding_attention_no_rope', 'full_attention_with_rope', 
+                'sliding_attention_with_rope', 'dummy', 'sub_attention'
+            ]
+            print("✓ ALLOWED_LAYER_TYPES added")
+    except:
+        pass
+    
+    # 6. Add rope_validation_forward function if missing
+    try:
+        from transformers.modeling_rope_utils import rope_validation_forward
+    except ImportError:
+        def rope_validation_forward(config, **kwargs):
+            """Forward validation for RoPE parameters"""
+            return True
+        
+        import transformers.modeling_rope_utils as ru
+        ru.rope_validation_forward = rope_validation_forward
+    
+    print("✓ All transformers patches applied successfully")
+
+# Apply patches IMMEDIATELY
+_patch_transformers()
+
+# Now import the rest of your dependencies
+import os
 import re
 import subprocess
-import os
-import shlex
+import json
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch
 
+# Continue with your normal code...
 MODEL_PATH = str(Path.home() / "ouro-model")
 
-# Load model with optimizations for external SSD
+# Optional: Add version check for debugging
+print(f"📦 Transformers version: {transformers.__version__}")
+print(f"📦 PyTorch version: {torch.__version__}")
+
+# Load your model as usual
 config = AutoConfig.from_pretrained(MODEL_PATH)
 config.total_ut_steps = 4
 
@@ -25,10 +150,10 @@ model = AutoModelForCausalLM.from_pretrained(
     config=config,
     device_map="auto",
     torch_dtype=torch.float16,
-    trust_remote_code=True,
-    low_cpu_mem_usage=True
+    trust_remote_code=True
 )
 model.eval()
+
 
 # Enhanced system prompt for full system access
 SYSTEM_PROMPT = """You are a powerful AI assistant with FULL SYSTEM ACCESS running locally on an external SSD.
